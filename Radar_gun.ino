@@ -1,5 +1,33 @@
+/*
+ * =====================================================
+ *  Radar Speed Display
+ * =====================================================
+ *
+ *  Reads target speeds from an HLK-LD2451 24 GHz radar module and shows
+ *  them on a 4-digit TM1637 7-segment display, much like a roadside
+ *  "YOUR SPEED" sign.
+ *
+ *  Hardware:
+ *    - Arduino Mega 2560 (uses hardware UART3 for the radar)
+ *    - HLK-LD2451 radar module   -> Serial3 (RX3 = pin 15)
+ *    - TM1637 4-digit display    -> CLK = pin 50, DIO = pin 52
+ *    - Potentiometer / analog in -> A1 (sets the speed limit)
+ *
+ *  Display behaviour (highest priority first):
+ *    1. While the knob is being turned, show the selected speed limit
+ *       (zero padded, e.g. "0035") until it has been still for 2 s.
+ *    2. If the radar sees a target, show the fastest target's speed in MPH.
+ *       The reading is held for 3 s after the target disappears.
+ *         - 1..4 MPH over the limit -> slow blink
+ *         - 5+  MPH over the limit  -> fast blink
+ *    3. Otherwise show an idle "running" animation: a single bottom
+ *       segment stepping across the four digits.
+ *
+ *  Debug output is printed on the USB serial port at 115200 baud.
+ */
+
 #include <Arduino.h>
-#include <TM1637Display.h>
+#include <TM1637Display.h>   // "TM1637" library by Avishay Orpaz
 
 // =====================================================
 // CONFIGURATION
@@ -8,45 +36,50 @@
 // ---------- Pins ----------
 const uint8_t DISPLAY_CLK_PIN = 50;
 const uint8_t DISPLAY_DIO_PIN = 52;
-const uint8_t RADAR_RX_PIN    = 15;   // Mega RX3
+const uint8_t RADAR_RX_PIN    = 15;   // Mega RX3 (informational; Serial3 is fixed to this pin)
 const uint8_t KNOB_ANALOG_PIN = A1;
 
 // ---------- Display ----------
-const uint8_t DISPLAY_BRIGHTNESS = 7;   // 0..7
+const uint8_t DISPLAY_BRIGHTNESS = 7;   // 0 (dimmest) .. 7 (brightest)
 
 // ---------- Radar UART ----------
-const unsigned long RADAR_BAUD = 115200;
+const unsigned long RADAR_BAUD = 115200;   // LD2451 default baud rate
 
 // ---------- Speed conversion ----------
-const float KMH_TO_MPH = 0.621371f;
+const float KMH_TO_MPH = 0.621371f;   // the radar reports km/h
 
-// Running indicator animation
-const unsigned long RUN_INDICATOR_INTERVAL_MS = 1500;
+// ---------- Idle animation ----------
+const unsigned long RUN_INDICATOR_INTERVAL_MS = 1500;   // time between animation steps
 
 // ---------- Knob calibration ----------
-// User requested:
-//   low voltage  -> 120 MPH
-//   high voltage -> 5 MPH
+// The knob voltage is mapped linearly onto the speed-limit range:
+//   voltage <= KNOBW_LOW_VOLTAGE_MPH_MIN  -> SPEED_LIMIT_MIN_MPH  (5 MPH)
+//   voltage >= KNOBW_HIGH_VOLTAGE_MPH_MAX -> SPEED_LIMIT_MAX_MPH  (120 MPH)
+//   anything in between is interpolated.
 //
-// NOTE: 5.5V cannot be measured directly on a Mega analog input.
-// Defaulting to 5.0V max. Change if your signal is scaled externally.
-const float ADC_REFERENCE_VOLTAGE = 5.0f;
-const float KNOBW_LOW_VOLTAGE_MPH_MIN = 0.1f;   // >= this voltage => min MPH
-const float KNOBW_HIGH_VOLTAGE_MPH_MAX  = 4.2f;   // <= this voltage => max MPH
+// The two voltage thresholds leave a small dead zone at each end of the
+// knob's travel so the extremes are easy to hit.
+//
+// NOTE: The Mega's analog inputs measure 0..5 V. If your control signal can
+// exceed 5 V, scale it down externally (e.g. a voltage divider) and adjust
+// ADC_REFERENCE_VOLTAGE / the thresholds to suit.
+const float ADC_REFERENCE_VOLTAGE      = 5.0f;
+const float KNOBW_LOW_VOLTAGE_MPH_MIN  = 0.1f;   // at/below this voltage => min MPH
+const float KNOBW_HIGH_VOLTAGE_MPH_MAX = 4.2f;   // at/above this voltage => max MPH
 
 const int   SPEED_LIMIT_MIN_MPH = 5;
 const int   SPEED_LIMIT_MAX_MPH = 120;
 
-// ---------- Knob behavior ----------
+// ---------- Knob behaviour ----------
 const unsigned long KNOB_SETTLE_HIDE_MS = 2000;   // show set speed while changing, then hide after this long
-const int KNOB_CHANGE_THRESHOLD_RAW = 1;          // ADC counts to consider "changed"
-const float KNOB_FILTER_ALPHA = 0.05f;            // 0..1, larger = more responsive
-const int KNOB_NOISE_DEADBAND_RAW   = 7;   // ignore tiny movement
+const int KNOB_CHANGE_THRESHOLD_RAW = 1;          // (currently unused) ADC counts to consider "changed"
+const float KNOB_FILTER_ALPHA = 0.05f;            // low-pass filter weight, 0..1; larger = more responsive
+const int KNOB_NOISE_DEADBAND_RAW   = 7;          // ignore filtered movement smaller than this (ADC counts)
 
-// ---------- Radar display behavior ----------
+// ---------- Radar display behaviour ----------
 const unsigned long RADAR_HOLD_AFTER_LOST_MS = 3000;   // keep last radar speed this long after signal disappears
 
-// ---------- Over-limit blink behavior ----------
+// ---------- Over-limit blink behaviour ----------
 const int OVER_LIMIT_SLOW_MIN_MPH = 1;   // 1..4 over => slow blink
 const int OVER_LIMIT_SLOW_MAX_MPH = 4;
 const int OVER_LIMIT_FAST_MIN_MPH = 5;   // 5+ over => fast blink
@@ -58,24 +91,26 @@ const unsigned long FAST_BLINK_ON_MS  = 200;
 const unsigned long FAST_BLINK_OFF_MS = 100;
 
 // ---------- Radar parsing ----------
-const uint8_t RADAR_MAX_TARGETS = 8;
-const uint16_t RADAR_PAYLOAD_MAX = 256;
+const uint8_t RADAR_MAX_TARGETS = 8;     // max targets decoded per frame
+const uint16_t RADAR_PAYLOAD_MAX = 256;  // frames claiming a longer payload are discarded
 
 // =====================================================
 // TYPES
 // =====================================================
 
+// One target as reported by the LD2451. The first two fields are per-frame
+// values copied into every target for convenience.
 struct RadarData {
-  byte targetQuantity;
-  byte alarmInformation;
+  byte targetQuantity;     // number of targets the radar reported in this frame
+  byte alarmInformation;   // alarm / status byte from the frame
 
-  byte angle;
-  byte distance;
-  byte speedDirection;
-  byte speed;      // km/h
-  byte snr;
+  byte angle;              // raw angle byte (sensor encodes with a 0x80 offset)
+  byte distance;           // distance to target in metres
+  byte speedDirection;     // approaching vs. moving away
+  byte speed;              // km/h
+  byte snr;                // signal-to-noise ratio
 
-  float speedMph;  // derived
+  float speedMph;          // derived from `speed`
 };
 
 // =====================================================
@@ -88,38 +123,41 @@ TM1637Display display(DISPLAY_CLK_PIN, DISPLAY_DIO_PIN);
 #define RadarSerial Serial3
 
 // ---------- Radar frame parsing ----------
+// LD2451 data frames look like:
+//   [F4 F3 F2 F1] [len lo] [len hi] [payload ... len bytes] [F8 F7 F6 F5]
 static const uint8_t HDR[4]  = {0xF4, 0xF3, 0xF2, 0xF1};
 static const uint8_t TAIL[4] = {0xF8, 0xF7, 0xF6, 0xF5};
 
+// States of the byte-at-a-time frame parser (see parseOneByte()).
 enum ParseState : uint8_t {
-  FIND_HDR,
-  READ_LEN,
-  READ_PAYLOAD,
-  READ_TAIL
+  FIND_HDR,       // scanning for the 4-byte header
+  READ_LEN,       // reading the 2-byte little-endian payload length
+  READ_PAYLOAD,   // copying payload bytes into `payload`
+  READ_TAIL       // verifying the 4-byte tail
 };
 
 ParseState parseState = FIND_HDR;
-uint8_t hdrPos = 0;
-uint8_t tailPos = 0;
-uint16_t payloadLen = 0;
-uint16_t payloadRead = 0;
-uint8_t payload[RADAR_PAYLOAD_MAX];
+uint8_t hdrPos = 0;                  // how many header bytes have matched so far
+uint8_t tailPos = 0;                 // how many tail bytes have matched so far
+uint16_t payloadLen = 0;             // payload length announced by the current frame
+uint16_t payloadRead = 0;            // payload bytes received so far
+uint8_t payload[RADAR_PAYLOAD_MAX];  // payload of the most recent frame
 
 // ---------- Knob state ----------
-float filteredKnobRaw = 0.0f;
-int lastStableKnobRaw = -1000;
-int currentSpeedLimitMph = SPEED_LIMIT_MAX_MPH;
-unsigned long lastKnobChangeMs = 0;
-bool knobPreviewActive = true;
+float filteredKnobRaw = 0.0f;                     // low-pass filtered ADC reading
+int lastStableKnobRaw = -1000;                    // last filtered value that passed the deadband
+int currentSpeedLimitMph = SPEED_LIMIT_MAX_MPH;   // the active speed limit
+unsigned long lastKnobChangeMs = 0;               // when the speed limit last changed
+bool knobPreviewActive = true;                    // true while the set speed is being shown
 
 // ---------- Radar state ----------
-bool radarHasRecentSignal = false;
-unsigned long lastRadarSignalMs = 0;
-float lastRadarSpeedMph = 0.0f;
+bool radarHasRecentSignal = false;   // true while a reading is fresh or within the hold time
+unsigned long lastRadarSignalMs = 0; // when the last non-zero reading arrived
+float lastRadarSpeedMph = 0.0f;      // most recent fastest-target speed
 
-// ---------- On Indicator ----------
-uint8_t runIndicatorPosition = 0;
-unsigned long lastRunIndicatorUpdate = 0;
+// ---------- Idle indicator ----------
+uint8_t runIndicatorPosition = 0;         // digit (0..3) currently lit by the animation
+unsigned long lastRunIndicatorUpdate = 0; // when the animation last stepped
 
 // =====================================================
 // HELPERS
@@ -137,13 +175,15 @@ int clampInt(int v, int lo, int hi) {
   return v;
 }
 
+// Convert a 10-bit ADC reading (0..1023) to volts.
 float rawToVoltage(float raw) {
   return raw * ADC_REFERENCE_VOLTAGE / 1023.0f;
 }
 
-// Maps knob voltage to MPH:
-// low voltage -> high MPH
-// high voltage -> low MPH
+// Maps knob voltage to a speed limit in MPH:
+//   low voltage  -> SPEED_LIMIT_MIN_MPH
+//   high voltage -> SPEED_LIMIT_MAX_MPH
+// with linear interpolation in between (see "Knob calibration" above).
 int knobVoltageToSpeedLimitMph(float volts)
 {
   // Clamp to limits first
@@ -153,7 +193,7 @@ int knobVoltageToSpeedLimitMph(float volts)
   if (volts >= KNOBW_HIGH_VOLTAGE_MPH_MAX)
     return SPEED_LIMIT_MAX_MPH;
 
-  // Linear interpolation
+  // Linear interpolation: t runs 0..1 across the usable voltage range
   float t = (volts - KNOBW_LOW_VOLTAGE_MPH_MIN) /
             (KNOBW_HIGH_VOLTAGE_MPH_MAX - KNOBW_LOW_VOLTAGE_MPH_MIN);
 
@@ -163,11 +203,14 @@ int knobVoltageToSpeedLimitMph(float volts)
   return clampInt((int)lroundf(mph), SPEED_LIMIT_MIN_MPH, SPEED_LIMIT_MAX_MPH);
 }
 
+// Show a number with leading zeros (e.g. "0035"). Used for the set speed so
+// it is visually distinct from a live radar reading.
 void showNumberZeroPadded(int value) {
   value = clampInt(value, 0, 9999);
   display.showNumberDec(value, true, 4, 0);   // leading zeros on
 }
 
+// Show a number right-aligned without leading zeros (e.g. "  35").
 void showNumberNormal(int value) {
   value = clampInt(value, 0, 9999);
   display.showNumberDec(value, false, 4, 0);  // no leading zeros
@@ -177,6 +220,8 @@ void blankDisplay() {
   display.clear();
 }
 
+// Non-blocking blink helper: returns true during the "on" part of a
+// repeating on/off cycle, based purely on the current time.
 bool blinkVisible(unsigned long nowMs, unsigned long onMs, unsigned long offMs) {
   unsigned long cycle = onMs + offMs;
   if (cycle == 0) return true;
@@ -184,6 +229,9 @@ bool blinkVisible(unsigned long nowMs, unsigned long onMs, unsigned long offMs) 
   return phase < onMs;
 }
 
+// Idle animation: lights the bottom segment of one digit at a time, moving
+// one digit to the right every RUN_INDICATOR_INTERVAL_MS. Shows the unit is
+// powered and waiting for a target.
 void drawRunIndicator(unsigned long nowMs) {
 
   if (nowMs - lastRunIndicatorUpdate < RUN_INDICATOR_INTERVAL_MS)
@@ -193,7 +241,7 @@ void drawRunIndicator(unsigned long nowMs) {
 
   uint8_t segments[4] = {0,0,0,0};
 
-  // bottom segment of the active digit
+  // Segment D (bottom) of the active digit
   segments[runIndicatorPosition] = 0x08;
 
   display.setSegments(segments);
@@ -207,9 +255,17 @@ void drawRunIndicator(unsigned long nowMs) {
 // RADAR PAYLOAD PARSING
 // =====================================================
 
+// Payload layout:
+//   [0]   target quantity
+//   [1]   alarm information
+//   then BYTES_PER_TARGET bytes per target:
+//   [+0] angle  [+1] distance  [+2] direction  [+3] speed (km/h)  [+4] SNR
 const uint8_t BYTES_PER_TARGET = 5;
 const uint8_t PAYLOAD_HEADER_BYTES = 2;
 
+// Decode a frame payload into `outTargets`. Returns the number of targets
+// written, which is limited by what the radar reported, what actually fits
+// in `len` bytes, and `maxTargets`.
 uint8_t parseRadarPayload(const uint8_t* payloadBuf,
                           uint16_t len,
                           RadarData* outTargets,
@@ -220,6 +276,7 @@ uint8_t parseRadarPayload(const uint8_t* payloadBuf,
   uint8_t targetQty = payloadBuf[0];
   uint8_t alarmInfo = payloadBuf[1];
 
+  // Never trust targetQty blindly: cap it by the bytes actually received.
   uint16_t availableBytes = len - PAYLOAD_HEADER_BYTES;
   uint8_t targetsThatFit = (uint8_t)(availableBytes / BYTES_PER_TARGET);
 
@@ -246,7 +303,9 @@ uint8_t parseRadarPayload(const uint8_t* payloadBuf,
   return count;
 }
 
-// Pick the fastest target, regardless of direction.
+// Decode the most recently received payload and report the speed of the
+// fastest target, regardless of direction. Returns false if the frame
+// contained no targets.
 bool payloadToSpeedMph(float &outMph) {
   if (payloadLen < PAYLOAD_HEADER_BYTES) return false;
 
@@ -273,6 +332,11 @@ bool payloadToSpeedMph(float &outMph) {
 // RADAR FRAME BYTE PARSER
 // =====================================================
 
+// Feed one byte from the radar UART into the frame state machine.
+// Returns true exactly when a complete, valid frame (header + length +
+// payload + tail) has been received; the payload is then in `payload` with
+// length `payloadLen`. Any unexpected byte drops back to searching for the
+// next header, so the parser resynchronises on its own after noise.
 bool parseOneByte(uint8_t b) {
   switch (parseState) {
     case FIND_HDR:
@@ -294,8 +358,9 @@ bool parseOneByte(uint8_t b) {
       lenBytes[lenPos++] = b;
       if (lenPos == 2) {
         lenPos = 0;
-        payloadLen = (uint16_t)lenBytes[0] | ((uint16_t)lenBytes[1] << 8);
+        payloadLen = (uint16_t)lenBytes[0] | ((uint16_t)lenBytes[1] << 8);   // little-endian
 
+        // Reject frames that would overflow the payload buffer.
         if (payloadLen > RADAR_PAYLOAD_MAX) {
           parseState = FIND_HDR;
           payloadLen = 0;
@@ -322,11 +387,13 @@ bool parseOneByte(uint8_t b) {
       if (b == TAIL[tailPos]) {
         tailPos++;
         if (tailPos == 4) {
+          // Complete frame received.
           parseState = FIND_HDR;
           tailPos = 0;
           return true;
         }
       } else {
+        // Bad tail: discard the frame and look for the next header.
         parseState = FIND_HDR;
         tailPos = 0;
       }
@@ -340,10 +407,15 @@ bool parseOneByte(uint8_t b) {
 // INPUT / STATE UPDATES
 // =====================================================
 
+// Read and debounce the speed-limit knob.
+// The raw ADC value is smoothed with an exponential low-pass filter, and
+// changes smaller than KNOB_NOISE_DEADBAND_RAW are ignored. When the
+// resulting speed limit changes, the display switches to "preview" mode;
+// preview ends once the knob has been still for KNOB_SETTLE_HIDE_MS.
 void updateKnob(unsigned long nowMs) {
   int raw = analogRead(KNOB_ANALOG_PIN);
 
-  // Low-pass filter
+  // Exponential low-pass filter (seeded with the first reading)
   if (filteredKnobRaw == 0.0f) {
     filteredKnobRaw = raw;
   } else {
@@ -378,13 +450,16 @@ void updateKnob(unsigned long nowMs) {
     Serial.print("  Limit MPH: ");
     Serial.println(currentSpeedLimitMph);
   } else {
-    // still moved, but not enough to change displayed MPH
+    // Still moved, but not enough to change the speed limit
     if (knobPreviewActive && (nowMs - lastKnobChangeMs >= KNOB_SETTLE_HIDE_MS)) {
       knobPreviewActive = false;
     }
   }
 }
 
+// Drain all pending radar bytes, update the latest speed when a complete
+// frame with a moving target arrives, and expire the reading once no
+// target has been seen for RADAR_HOLD_AFTER_LOST_MS.
 void updateRadar(unsigned long nowMs) {
   while (RadarSerial.available() > 0) {
     uint8_t b = (uint8_t)RadarSerial.read();
@@ -403,6 +478,7 @@ void updateRadar(unsigned long nowMs) {
     }
   }
 
+  // Hold timeout: forget the last speed once the target has been gone a while
   if (radarHasRecentSignal && (nowMs - lastRadarSignalMs > RADAR_HOLD_AFTER_LOST_MS)) {
     radarHasRecentSignal = false;
     lastRadarSpeedMph = 0.0f;
@@ -413,6 +489,8 @@ void updateRadar(unsigned long nowMs) {
 // DISPLAY LOGIC
 // =====================================================
 
+// Decide what the display should show this pass (see the priority list at
+// the top of the file).
 void updateDisplay(unsigned long nowMs) {
   // Priority 1: knob preview while user is adjusting
   if (knobPreviewActive) {
@@ -425,7 +503,7 @@ void updateDisplay(unsigned long nowMs) {
     int speedMphInt = (int)lroundf(lastRadarSpeedMph);
     int overBy = speedMphInt - currentSpeedLimitMph;
 
-    bool shouldShow = true;
+    bool shouldShow = true;   // at or under the limit: steady display
 
     if (overBy >= OVER_LIMIT_FAST_MIN_MPH) {
       shouldShow = blinkVisible(nowMs, FAST_BLINK_ON_MS, FAST_BLINK_OFF_MS);
@@ -451,7 +529,7 @@ void updateDisplay(unsigned long nowMs) {
 // =====================================================
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(115200);         // USB debug output
   RadarSerial.begin(RADAR_BAUD);
 
   pinMode(KNOB_ANALOG_PIN, INPUT);
@@ -459,7 +537,8 @@ void setup() {
   display.setBrightness(DISPLAY_BRIGHTNESS, true);
   display.clear();
 
-  // Initialize knob state immediately
+  // Initialise knob state immediately so the first loop doesn't see a
+  // spurious "change", and show the current set speed at power-up.
   int raw = analogRead(KNOB_ANALOG_PIN);
   filteredKnobRaw = raw;
   lastStableKnobRaw = raw;
@@ -470,9 +549,10 @@ void setup() {
   Serial.println("Mega + HLK-LD2451 + TM1637 speed display ready.");
   Serial.println("Radar: Serial3 RX=15");
   Serial.println("Display CLK=50 DIO=52");
-  Serial.println("Knob=A15");
+  Serial.println("Knob=A1");
 }
 
+// Everything is non-blocking: each pass reads inputs, then redraws.
 void loop() {
   unsigned long nowMs = millis();
 
