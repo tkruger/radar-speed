@@ -72,7 +72,6 @@ const int   SPEED_LIMIT_MAX_MPH = 120;
 
 // ---------- Knob behaviour ----------
 const unsigned long KNOB_SETTLE_HIDE_MS = 2000;   // show set speed while changing, then hide after this long
-const int KNOB_CHANGE_THRESHOLD_RAW = 1;          // (currently unused) ADC counts to consider "changed"
 const float KNOB_FILTER_ALPHA = 0.05f;            // low-pass filter weight, 0..1; larger = more responsive
 const int KNOB_NOISE_DEADBAND_RAW   = 7;          // ignore filtered movement smaller than this (ADC counts)
 
@@ -158,6 +157,7 @@ float lastRadarSpeedMph = 0.0f;      // most recent fastest-target speed
 // ---------- Idle indicator ----------
 uint8_t runIndicatorPosition = 0;         // digit (0..3) currently lit by the animation
 unsigned long lastRunIndicatorUpdate = 0; // when the animation last stepped
+bool runIndicatorShowing = false;         // true while the display is in idle mode
 
 // =====================================================
 // HELPERS
@@ -232,9 +232,11 @@ bool blinkVisible(unsigned long nowMs, unsigned long onMs, unsigned long offMs) 
 // Idle animation: lights the bottom segment of one digit at a time, moving
 // one digit to the right every RUN_INDICATOR_INTERVAL_MS. Shows the unit is
 // powered and waiting for a target.
-void drawRunIndicator(unsigned long nowMs) {
+// Pass force = true to draw straight away (e.g. when entering idle mode) so
+// the previous number doesn't linger until the next animation step.
+void drawRunIndicator(unsigned long nowMs, bool force) {
 
-  if (nowMs - lastRunIndicatorUpdate < RUN_INDICATOR_INTERVAL_MS)
+  if (!force && nowMs - lastRunIndicatorUpdate < RUN_INDICATOR_INTERVAL_MS)
     return;
 
   lastRunIndicatorUpdate = nowMs;
@@ -370,7 +372,10 @@ bool parseOneByte(uint8_t b) {
         }
 
         payloadRead = 0;
-        parseState = READ_PAYLOAD;
+        tailPos = 0;
+        // An empty payload has nothing to read: go straight to the tail so
+        // the first tail byte isn't swallowed as payload.
+        parseState = (payloadLen == 0) ? READ_TAIL : READ_PAYLOAD;
       }
       break;
     }
@@ -494,12 +499,14 @@ void updateRadar(unsigned long nowMs) {
 void updateDisplay(unsigned long nowMs) {
   // Priority 1: knob preview while user is adjusting
   if (knobPreviewActive) {
+    runIndicatorShowing = false;
     showNumberZeroPadded(currentSpeedLimitMph);
     return;
   }
 
   // Priority 2: radar speed if present / within hold time
   if (radarHasRecentSignal) {
+    runIndicatorShowing = false;
     int speedMphInt = (int)lroundf(lastRadarSpeedMph);
     int overBy = speedMphInt - currentSpeedLimitMph;
 
@@ -520,8 +527,11 @@ void updateDisplay(unsigned long nowMs) {
     return;
   }
 
-  // Priority 3: idle state → show running indicator
-  drawRunIndicator(nowMs);
+  // Priority 3: idle state → show running indicator.
+  // On the first pass after another mode, draw immediately to clear the
+  // old number instead of waiting for the next animation step.
+  drawRunIndicator(nowMs, !runIndicatorShowing);
+  runIndicatorShowing = true;
 }
 
 // =====================================================
